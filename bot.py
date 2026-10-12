@@ -1,23 +1,85 @@
 import os
+import sqlite3
 import telebot
 from telebot import types
 
-# Bot Configuration (Apnar notun token ekhane boshaben)
-TOKEN = "8655619720:AAEoktF8J9JbAIwcvQf6WgXOqO8SXiPQvOA"
+# Bot Configuration
+TOKEN = "8655619720:AAG6qYbDiLjv8G_pR7Nt8kBJF003GCldAd0"
 ADMIN_ID = 6913254882
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
-# In-memory storage (Data tracking er jonno)
-all_users = set()       # Shob user-der ID
-user_channels = {}      # {user_id: [channel_usernames]}
-user_info = {}          # {user_id: "Name (@username)"}
-post_cache = {}         # Post creation cache
-broadcast_target = {}   # Broadcast tracking
-help_mode = set()       # Help desk active users
-broadcast_mode = set()  # Admin broadcast mode
+# --- SQLite Database Setup ---
+def init_db():
+    conn = sqlite3.connect('bot_database.db', check_same_thread=False)
+    cursor = conn.cursor()
+    # Users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            username TEXT
+        )
+    ''')
+    # Channels table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS channels (
+            user_id INTEGER,
+            channel TEXT,
+            PRIMARY KEY (user_id, channel)
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-# Main Persistent Keyboard (Chat box er niche thakbe)
+init_db()
+
+# Database Helper Functions
+def add_user_db(user_id, name, username):
+    conn = sqlite3.connect('bot_database.db', check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO users (user_id, name, username) VALUES (?, ?, ?)', (user_id, name, username))
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect('bot_database.db', check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id, name, username FROM users')
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def add_channel_db(user_id, channel):
+    conn = sqlite3.connect('bot_database.db', check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO channels (user_id, channel) VALUES (?, ?)', (user_id, channel))
+    conn.commit()
+    conn.close()
+
+def get_user_channels(user_id):
+    conn = sqlite3.connect('bot_database.db', check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('SELECT channel FROM channels WHERE user_id = ?', (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+def get_all_channels():
+    conn = sqlite3.connect('bot_database.db', check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('SELECT DISTINCT channel FROM channels')
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+# Caches for workflow
+post_cache = {}
+broadcast_target = {}
+help_mode = set()
+broadcast_mode = set()
+
+# Main Persistent Keyboard
 def get_main_keyboard(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(
@@ -38,9 +100,9 @@ def send_welcome(message):
     name = message.from_user.first_name
     username = message.from_user.username or "None"
 
-    # New user tracking & Admin Notification
-    if user_id not in all_users:
-        all_users.add(user_id)
+    # Check if user already exists in DB
+    existing_users = [u[0] for u in get_all_users()]
+    if user_id not in existing_users:
         if user_id != ADMIN_ID:
             try:
                 bot.send_message(
@@ -53,7 +115,7 @@ def send_welcome(message):
             except Exception:
                 pass
 
-    user_info[user_id] = f"{name} (@{username})"
+    add_user_db(user_id, name, username)
 
     welcome_text = (
         f"👋 **Welcome {name} to Controller Bot!**\n\n"
@@ -80,7 +142,7 @@ def handle_menu_buttons(message):
         bot.register_next_step_handler(message, save_user_channel)
 
     elif text == "📁 My Channels":
-        channels = user_channels.get(user_id, [])
+        channels = get_user_channels(user_id)
         if not channels:
             bot.send_message(user_id, "❌ Apni ekhono kono channel ba group add korenni. Prothome '📢 Add Channel' use korun.")
         else:
@@ -88,7 +150,7 @@ def handle_menu_buttons(message):
             bot.send_message(user_id, f"📁 **Apnar Connected Channels/Groups:**\n\n{ch_list}")
 
     elif text == "✨ Create Post":
-        channels = user_channels.get(user_id, [])
+        channels = get_user_channels(user_id)
         if not channels:
             bot.send_message(user_id, "⚠️ Prothome '📢 Add Channel' diye ekta channel/group add korun.")
             return
@@ -120,20 +182,21 @@ def save_user_channel(message):
         bot.send_message(user_id, "❌ Invalid format! Please use `@channelusername` or valid chat ID starting with `-100`.")
         return
 
-    if user_id not in user_channels:
-        user_channels[user_id] = []
-    
-    if channel not in user_channels[user_id]:
-        user_channels[user_id].append(channel)
-    
+    add_channel_db(user_id, channel)
     bot.send_message(user_id, f"✅ Channel/Group <b>{channel}</b> successfully added!")
 
-# User Help Message Handler (Sends directly to Admin)
+# User Help Message Handler
 @bot.message_handler(func=lambda msg: msg.from_user.id in help_mode)
 def process_help_message(message):
     user_id = message.from_user.id
     help_mode.remove(user_id)
-    user_name = user_info.get(user_id, str(user_id))
+    
+    users = get_all_users()
+    user_name = str(user_id)
+    for u in users:
+        if u[0] == user_id:
+            user_name = f"{u[1]} (@{u[2]})"
+            break
     
     try:
         bot.send_message(
@@ -194,26 +257,27 @@ def handle_callbacks(call):
     # Admin Panel Actions
     elif user_id == ADMIN_ID:
         if data == "admin_stats":
-            total_users = len(all_users)
-            total_channels = sum(len(chs) for chs in user_channels.values())
+            users = get_all_users()
+            channels = get_all_channels()
             bot.answer_callback_query(call.id)
-            bot.send_message(ADMIN_ID, f"📊 **Bot Statistics:**\n\n👥 Total Users: {total_users}\n📁 Total Connected Channels/Groups: {total_channels}")
+            bot.send_message(ADMIN_ID, f"📊 **Bot Statistics (Database):**\n\n👥 Total Users: {len(users)}\n📁 Total Connected Channels/Groups: {len(channels)}")
 
         elif data == "admin_users":
             bot.answer_callback_query(call.id)
-            if not all_users:
+            users = get_all_users()
+            if not users:
                 bot.send_message(ADMIN_ID, "❌ Kono user nei.")
             else:
-                u_list = "\n".join([f"• {user_info.get(u, u)} (ID: <code>{u}</code>)" for u in list(all_users)[:40]])
+                u_list = "\n".join([f"• {u[1]} (@{u[2]}) - ID: <code>{u[0]}</code>" for u in users[:40]])
                 bot.send_message(ADMIN_ID, f"👥 **Users List (Max 40):**\n\n{u_list}")
 
         elif data == "admin_channels":
             bot.answer_callback_query(call.id)
-            all_chs = [ch for chs in user_channels.values() for ch in chs]
-            if not all_chs:
+            channels = get_all_channels()
+            if not channels:
                 bot.send_message(ADMIN_ID, "❌ Kono channel add kora hoyni.")
             else:
-                c_list = "\n".join([f"• <code>{ch}</code>" for ch in all_chs[:40]])
+                c_list = "\n".join([f"• <code>{ch}</code>" for ch in channels[:40]])
                 bot.send_message(ADMIN_ID, f"📁 **Channels/Groups List (Max 40):**\n\n{c_list}")
 
         elif data == "admin_broadcast_menu":
@@ -282,10 +346,11 @@ def execute_broadcast(message):
     targets_list = []
 
     if target in ["users", "both"]:
-        targets_list.extend(list(all_users))
+        users = get_all_users()
+        targets_list.extend([u[0] for u in users])
     if target in ["channels", "both"]:
-        all_chs = [ch for chs in user_channels.values() for ch in chs]
-        targets_list.extend(all_chs)
+        channels = get_all_channels()
+        targets_list.extend(channels)
 
     for t in targets_list:
         try:
@@ -300,5 +365,5 @@ def execute_broadcast(message):
     bot.send_message(admin_id, f"📢 **Broadcast Completed!** Successfully sent to {success_count} targets ({target}).")
 
 if __name__ == "__main__":
-    print("Bot is active and running smoothly...")
+    print("Bot with SQLite Database is active and running smoothly...")
     bot.infinity_polling()
